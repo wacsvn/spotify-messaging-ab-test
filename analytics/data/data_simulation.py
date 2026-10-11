@@ -1,115 +1,201 @@
-import numpy as np
-import pandas as pd
-import uuid
+"""
+Tiered simulation for the Smart Queue A/B test.
+
+Design targets (pre-registered, do NOT tune these to results):
+  - Baseline OEC: 840 min / enrolled user / week, between-user SD ~360
+  - Compliance: 40% of Treatment users ever use the banner (Control: 0%)
+  - Assumed TRUE effect: ~+2.8% ITT (just above the 2% MDE), concentrated in
+    compliers, with a novelty bump in weeks 1-2 that settles by week 3
+  - Cannibalization: banner minutes partly replace autoplay; search unchanged
+  - W4 retention 95.2% / 94.8%, crash rate 0.20% / 0.22% (control / treatment)
+
+Structure: assignment -> compliance -> per-user baseline multiplier ->
+daily noise -> treatment effect (compliers only) -> churn -> crashes.
+"""
+
+import math
 import os
 
-# 1. Establish Replication Anchors & Design Scale
-np.random.seed(42)
-n_per_variant = 7210
-total_users = n_per_variant * 2
-days_in_experiment = 28
+import numpy as np
+import pandas as pd
 
-# 2. Initialize Cohort Assignment Dataframes (Probabilistic Variant Assignment)
-user_ids = [str(uuid.uuid4())[:8] for _ in range(total_users)]
+# ---------------------------------------------------------------- config ---
+SEED = 42
+N_PER_VARIANT = 7210
+DAYS = 28
+COMPLIANCE = 0.40
 
-# Ingest realistic variance via independent Bernoulli assignment trials
-variants = np.random.choice(["control", "treatment"], size=total_users, p=[0.5, 0.5])
+# Baseline daily behavior (minutes). 30 + 90 = 120 min/day = 840 min/week.
+SEARCH_MEAN, SEARCH_SD = 30.0, 15.0
+AUTOPLAY_MEAN, AUTOPLAY_SD = 90.0, 45.0
+MINUTES_PER_SEARCH_SESSION = 12.5  # 30 min/day -> 2.4 sessions/day -> 16.8/week
 
-df_users = pd.DataFrame({"user_id": user_ids, "variant": variants})
+# Between-user heterogeneity: lognormal multiplier with mean 1.
+# Tuned so the control weekly SD lands near the pre-registered 360.
+SIGMA_USER = 0.40
 
-actual_control_n = sum(df_users["variant"] == "control")
-actual_treatment_n = sum(df_users["variant"] == "treatment")
+# Treatment effect for compliers, steady state (minutes/day, before the
+# per-user multiplier and novelty profile). Net = +7.5 min/day.
+SMART_QUEUE_MEAN, SMART_QUEUE_SD = 11.0, 4.0
+CANNIBALIZE_AUTOPLAY_MEAN, CANNIBALIZE_AUTOPLAY_SD = 3.5, 1.5
 
-print("--- Real-World Assignment Variance Injected ---")
-print(f"Actual Control Sample: {actual_control_n:,} users")
-print(f"Actual Treatment Sample: {actual_treatment_n:,} users")
 
-# 3. Model Local Behavioral Parameters (Compliance & Baseline)
-df_users["complier"] = 0
-treatment_mask = df_users["variant"] == "treatment"
-actual_treatment_indices = df_users[treatment_mask].index
+# Novelty: effect is stronger early and settles by week 3.
+def novelty_multiplier(day: int) -> float:
+    if day <= 7:
+        return 1.40
+    if day <= 14:
+        return 1.15
+    return 1.00
 
-# Dynamically pull 40% based on the size of the actual treatment cohort generated
-compliant_indices = np.random.choice(
-    actual_treatment_indices,
-    size=int(len(actual_treatment_indices) * 0.40),
-    replace=False,
-)
-df_users.loc[compliant_indices, "complier"] = 1
 
-# 4. Generate Daily Logged Stream Heartbeats (Calibrated to 75% Autoplay Mix / 95% Retention)
-all_daily_records = []
+RETENTION_P = {"control": 0.952, "treatment": 0.948}
+CRASH_P = {"control": 0.0020, "treatment": 0.0022}
 
-# Pre-calculate user-level retention flags to mirror your exact 95.0% brief metric
-df_users["is_retained_w4"] = 1
-for idx, row in df_users.iterrows():
-    retention_probability = 0.952 if row["variant"] == "control" else 0.948
-    if np.random.rand() > retention_probability:
-        df_users.loc[idx, "is_retained_w4"] = 0
 
-for day in range(1, days_in_experiment + 1):
-    for idx, row in df_users.iterrows():
+def _clipped_normal_mean(mu: float, sd: float) -> float:
+    """E[max(0, N(mu, sd))] so the calibration accounts for clamping at 0."""
+    z = mu / sd
+    cdf = 0.5 * (1 + math.erf(z / math.sqrt(2)))
+    pdf = math.exp(-0.5 * z * z) / math.sqrt(2 * math.pi)
+    return mu * cdf + sd * pdf
 
-        # Eliminate churned user traffic from Week 4 logs
-        if day >= 21 and df_users.loc[idx, "is_retained_w4"] == 0:
-            continue
 
-        # CALIBRATED ENSEMBLE MIX:
-        # Generates ~30 minutes/day search (210 mins/wk) and ~90 minutes/day autoplay (630 mins/wk)
-        base_search_minutes = np.random.normal(loc=30.0, scale=15.0)
-        base_autoplay_minutes = np.random.normal(loc=90.0, scale=45.0)
+def main():
+    rng = np.random.default_rng(SEED)
+    n_total = N_PER_VARIANT * 2
 
-        # Clamp to 0 to prevent negative values from the distribution spreads
-        base_search_minutes = max(0, float(base_search_minutes))
-        base_autoplay_minutes = max(0, float(base_autoplay_minutes))
+    # 1. Assignment: independent Bernoulli trials (realistic; makes SRM check meaningful)
+    ids = rng.choice(16**8, size=n_total, replace=False)  # unique 8-hex ids, seeded
+    user_ids = np.array([f"{i:08x}" for i in ids])
+    variant = rng.choice(["control", "treatment"], size=n_total, p=[0.5, 0.5])
+    is_treat = variant == "treatment"
 
-        # Inject the treatment effect (+2% target relative OEC lift on the total)
-        if row["variant"] == "treatment" and row["complier"] == 1:
-            smart_queue_minutes = max(0, float(np.random.normal(loc=46.0, scale=15.0)))
-            # Smart queue converts passive autoplay into active choice interaction
-            base_autoplay_minutes = max(
-                0,
-                base_autoplay_minutes
-                - max(0, float(np.random.normal(loc=12.0, scale=3.0))),
-            )
-            base_search_minutes += max(0, float(np.random.normal(loc=4.0, scale=2.0)))
-        else:
-            smart_queue_minutes = 0
+    # 2. Compliance: exactly 40% of the realized treatment arm
+    complier = np.zeros(n_total, dtype=int)
+    treat_idx = np.flatnonzero(is_treat)
+    chosen = rng.choice(treat_idx, size=int(len(treat_idx) * COMPLIANCE), replace=False)
+    complier[chosen] = 1
+    is_complier_treated = (is_treat & (complier == 1))[:, None]
 
-        total_daily_mins = (
-            base_search_minutes + base_autoplay_minutes + smart_queue_minutes
-        )
+    # 3. Per-user baseline multiplier (mean 1) -> between-user variance
+    mult = rng.lognormal(mean=-0.5 * SIGMA_USER**2, sigma=SIGMA_USER, size=n_total)[
+        :, None
+    ]
 
-        # EXACT SESSION-LEVEL COEFFICIENTS: Grounded to return your clean 0.20% session profile
-        error_rate = 0.0020 if row["variant"] == "control" else 0.0025
-        crashes_encountered = np.random.binomial(n=1, p=error_rate)
+    # 4. Calibrate base daily means so enrolled-user mean ~ 840 min/week
+    #    after clamping and W4 churn (days 21-28 missing for churned users).
+    raw_daily = _clipped_normal_mean(SEARCH_MEAN, SEARCH_SD) + _clipped_normal_mean(
+        AUTOPLAY_MEAN, AUTOPLAY_SD
+    )
+    present_frac = 1 - (1 - RETENTION_P["control"]) * 8 / DAYS
+    cal = 840.0 / (7 * raw_daily * present_frac)
 
-        all_daily_records.append(
-            {
-                "user_id": row["user_id"],
-                "variant": row["variant"],
-                "is_complier": row["complier"],
-                "experiment_day": day,
-                "search_minutes": base_search_minutes,
-                "autoplay_minutes": base_autoplay_minutes,
-                "smart_queue_minutes": smart_queue_minutes,
-                "total_minutes": total_daily_mins,
-                "crashes": crashes_encountered,
-                "w4_active_day": 1 if day >= 21 else 0,
-            }
-        )
+    shape = (n_total, DAYS)
+    search = np.clip(rng.normal(SEARCH_MEAN * cal, SEARCH_SD, shape), 0, None) * mult
+    autoplay = (
+        np.clip(rng.normal(AUTOPLAY_MEAN * cal, AUTOPLAY_SD, shape), 0, None) * mult
+    )
 
-df_experiment_log = pd.DataFrame(all_daily_records)
+    # 5. Treatment effect (compliers only), scaled by user multiplier and novelty
+    nov = np.array([novelty_multiplier(d) for d in range(1, DAYS + 1)])[None, :]
+    sq_raw = np.clip(rng.normal(SMART_QUEUE_MEAN, SMART_QUEUE_SD, shape), 0, None)
+    cann_raw = np.clip(
+        rng.normal(CANNIBALIZE_AUTOPLAY_MEAN, CANNIBALIZE_AUTOPLAY_SD, shape), 0, None
+    )
+    smart_queue = np.where(is_complier_treated, sq_raw * mult * nov, 0.0)
+    autoplay = np.where(
+        is_complier_treated,
+        np.clip(autoplay - cann_raw * mult * nov, 0, None),
+        autoplay,
+    )
 
-# 5. Output Sanity Verification Checks
-print("\n--- Simulated Dataset Generation Complete ---")
-print(f"Total Rows Generated: {len(df_experiment_log):,}")
-print("Approximate Weekly Mean Check per Enrolled User:")
-print(df_experiment_log.groupby("variant")["total_minutes"].sum() / n_per_variant / 4.0)
+    total = search + autoplay + smart_queue
+    search_sessions = rng.poisson(search / MINUTES_PER_SEARCH_SESSION)
 
-# 6. Save Data to Repo Pipeline Directory (Robust Subfolder Path Execution)
-current_script_dir = os.path.dirname(os.path.abspath(__file__))
-output_file_path = os.path.join(current_script_dir, "simulated_experiment_log.csv")
+    # 6. Retention (W4 churn) and crashes
+    p_ret = np.where(is_treat, RETENTION_P["treatment"], RETENTION_P["control"])
+    retained = rng.random(n_total) < p_ret
+    p_crash = np.where(is_treat, CRASH_P["treatment"], CRASH_P["control"])[:, None]
+    crashes = rng.binomial(1, p_crash, shape)
 
-df_experiment_log.to_csv(output_file_path, index=False)
-print(f"\n✅ File successfully written to disk at:\n{output_file_path}")
+    day_grid = np.tile(np.arange(1, DAYS + 1), (n_total, 1))
+    present = ~((day_grid >= 21) & (~retained[:, None]))  # churned users vanish in W4
+
+    df = pd.DataFrame(
+        {
+            "user_id": np.repeat(user_ids, DAYS)[present.ravel()],
+            "variant": np.repeat(variant, DAYS)[present.ravel()],
+            "is_complier": np.repeat(complier, DAYS)[present.ravel()],
+            "experiment_day": day_grid.ravel()[present.ravel()],
+            "search_minutes": search.ravel()[present.ravel()],
+            "search_sessions": search_sessions.ravel()[present.ravel()],
+            "autoplay_minutes": autoplay.ravel()[present.ravel()],
+            "smart_queue_minutes": smart_queue.ravel()[present.ravel()],
+            "total_minutes": total.ravel()[present.ravel()],
+            "crashes": crashes.ravel()[present.ravel()],
+            "w4_active_day": (day_grid.ravel()[present.ravel()] >= 21).astype(int),
+        }
+    )
+
+    # 7. Sanity report vs. design targets
+    print(f"Rows: {len(df):,} | Users: {df.user_id.nunique():,}")
+    print(df.groupby("variant").user_id.nunique().to_string())
+    per_user = df.groupby(["user_id", "variant", "is_complier"], as_index=False).agg(
+        total=("total_minutes", "sum"), sessions=("search_sessions", "sum")
+    )
+    per_user["weekly"] = per_user.total / 4
+    stats = per_user.groupby("variant").weekly.agg(["mean", "std"])
+    print("\nWeekly minutes / enrolled user (target mean 840, SD ~360):")
+    print(stats.round(1).to_string())
+    c = per_user[per_user.variant == "control"].weekly
+    t = per_user[per_user.variant == "treatment"].weekly
+    itt = t.mean() - c.mean()
+    print(
+        f"\nITT lift: {itt:+.1f} min/wk ({itt / c.mean() * 100:+.2f}%)  [MDE = +16.8, 2.0%]"
+    )
+    comp = per_user[
+        (per_user.variant == "treatment") & (per_user.is_complier == 1)
+    ].weekly
+    noncomp = per_user[
+        (per_user.variant == "treatment") & (per_user.is_complier == 0)
+    ].weekly
+    print(
+        f"Complier lift vs control: {comp.mean() - c.mean():+.1f} | Non-complier vs control: {noncomp.mean() - c.mean():+.1f}"
+    )
+
+    df["week"] = (df.experiment_day - 1) // 7 + 1
+    wk = df.groupby(["week", "variant"]).total_minutes.sum().unstack()
+    n_by = df.groupby("variant").user_id.nunique()
+    wk_pu = wk.div(n_by, axis=1)
+    print("\nWeekly lift (treatment - control, per enrolled user) -> novelty decay:")
+    print((wk_pu.treatment - wk_pu.control).round(1).to_string())
+
+    print("\nW4 retention by variant:")
+    print(
+        df[df.week == 4]
+        .groupby("variant")
+        .user_id.nunique()
+        .div(n_by)
+        .round(4)
+        .to_string()
+    )
+    print("Crash rate per user-day:")
+    print(df.groupby("variant").crashes.mean().round(5).to_string())
+    print("Search sessions / user / week:")
+    print((df.groupby("variant").search_sessions.sum() / n_by / 4).round(2).to_string())
+    print("Autoplay minutes / user / week:")
+    print(
+        (df.groupby("variant").autoplay_minutes.sum() / n_by / 4).round(1).to_string()
+    )
+
+    df = df.drop(columns="week")
+    out = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "simulated_experiment_log.csv"
+    )
+    df.to_csv(out, index=False)
+    print(f"\nWritten: {out}")
+
+
+if __name__ == "__main__":
+    main()

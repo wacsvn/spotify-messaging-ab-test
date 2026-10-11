@@ -38,6 +38,7 @@ INSERT_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,36}$")
 
 PROPERTY_COLUMNS = [
     "search_minutes",
+    "search_sessions",
     "autoplay_minutes",
     "smart_queue_minutes",
     "total_minutes",
@@ -105,7 +106,7 @@ def send_batch(batch, url, token, attempt_limit=5):
 
 def main():
     ap = argparse.ArgumentParser()
-    default_csv = Path(__file__).parent / "simulated_experiment_log.csv"
+    default_csv = Path(__file__).parent  / "simulated_experiment_log.csv"
     ap.add_argument("--csv", default=str(default_csv))
     ap.add_argument("--event-name", default="app_session_summary")
     ap.add_argument(
