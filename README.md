@@ -1,5 +1,7 @@
 # 🎧 Spotify "Smart Queue" A/B Test: Reproducible Experimentation Pipeline
 
+**Supporting Experiment Document on Notion:** [https://app.notion.com/p/Spotify-Smart-Queue-Feature-A-B-Test-Experiment-Document-3f6f9fe7805d80c68c15e2c5daba1b96?showMoveTo=true&saveParent=true](https://app.notion.com/p/Spotify-Smart-Queue-Feature-A-B-Test-Experiment-Document-3f6f9fe7805d80c68c15e2c5daba1b96?showMoveTo=true&saveParent=true)
+
 End-to-end product analytics project: a simulated A/B test of a "Smart Queue" feature (an interactive 3-choice "Next Recommended Songs" banner) on a Spotify-style app. It covers the full workflow from business question to launch recommendation: metrics, tracking plan, power analysis, pre-registration, data simulation, SRM validation, BigQuery aggregation, hypothesis testing, and a Mixpanel dashboard.
 
 > [!NOTE]
